@@ -281,6 +281,14 @@ impl SheepWarsPlugin {
         }
     }
 
+    #[command("rejouer")]
+    async fn rejouer(&self, ctx: Context) {
+        match self.game() {
+            Some(game) => game.replay(&ctx.sender).await,
+            None => ctx.reply("§cLe jeu n'est pas prêt."),
+        }
+    }
+
     #[command("sheepwars")]
     async fn sheepwars(&self, ctx: Context, #[suggest(Self::actions)] action: String) {
         let Some(game) = self.game() else {
