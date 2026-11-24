@@ -642,7 +642,7 @@ fn sheepwars_full_lifecycle_orchestrator_countdown_combat_and_ephemeral_end() {
     core.run_until("alice sees her rewards", |c| {
         confirm_teleports(&mut c.server, &mut alice);
         confirm_teleports(&mut c.server, &mut bob);
-        alice.said("+150 XP SheepWars") && bob.said("+50 XP SheepWars")
+        alice.said("+150 XP") && bob.said("+50 XP") && alice.said("RÉCAP DE PARTIE • SheepWars")
     });
 
     // Celebration ends -> ReturnAllToLobby + Ending phase update
