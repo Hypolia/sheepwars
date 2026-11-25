@@ -167,6 +167,8 @@ pub enum Action {
     SwapBlocks {
         a: Cell,
         b: Cell,
+        lose_a: bool,
+        lose_b: bool,
     },
 }
 

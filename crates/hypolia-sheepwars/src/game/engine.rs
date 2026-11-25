@@ -25,9 +25,10 @@ use super::effects::Effects;
 use super::fall_guard::FallGuards;
 use super::flight::{
     EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    RIDER_MAX_SPEED, arms_on_impact, can_launch, chase_detonates, chase_velocity,
-    disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks, initial_velocity,
-    rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears, torpedo_triggered,
+    RIDER_MAX_SPEED, anchors_on_landing, arms_on_impact, can_launch, chase_detonates,
+    chase_velocity, disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks,
+    initial_velocity, rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears,
+    torpedo_triggered,
 };
 use super::intent::Intent;
 use super::report::{
@@ -42,8 +43,9 @@ use crate::hud::{Hud, bossbar_progress, bossbar_title};
 use crate::orchestrator::{SheepWarsOrchestratorClient, spectates_here};
 use crate::sheep::{
     Action, HEALING_DURATION_TICKS, HEALING_PULSE_TICKS, ParticleKind, SEEKER_RANGE,
-    TORPEDO_TRIGGER_RADIUS, Vec3, apply, chases_after_impact, clamp_speed, display_name,
-    flies_straight, healing_pulse, nearest_enemy, plan, sheep_dye_color, sheep_wool, spawn_point,
+    TORPEDO_TRIGGER_RADIUS, Vec3, WARP_DURATION_TICKS, apply, chases_after_impact, clamp_speed,
+    display_name, flies_straight, healing_pulse, nearest_enemy, plan, sheep_dye_color, sheep_wool,
+    spawn_point,
 };
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
@@ -129,6 +131,12 @@ struct ActiveHealing {
     pulses: u32,
 }
 
+#[derive(Debug)]
+struct ActiveWarp {
+    entity: Entity,
+    remaining_ticks: u32,
+}
+
 struct State {
     session: Session,
     players: HashMap<PlayerId, Player>,
@@ -137,6 +145,7 @@ struct State {
     flights: Vec<Airborne>,
     armed: Vec<ArmedSheep>,
     healings: Vec<ActiveHealing>,
+    warps: Vec<ActiveWarp>,
     effects: Effects,
     arrows: Vec<TrackedArrow>,
     celebration: Option<Celebration>,
@@ -188,6 +197,7 @@ impl Game {
                 flights: Vec::new(),
                 armed: Vec::new(),
                 healings: Vec::new(),
+                warps: Vec::new(),
                 effects: Effects::new(),
                 arrows: Vec::new(),
                 celebration: None,
@@ -625,6 +635,8 @@ impl Game {
         state.flights.retain(|a| a.entity.entity_id != entity_id);
         state.armed.retain(|a| a.entity.entity_id != entity_id);
         state.healings.retain(|t| t.entity.entity_id != entity_id);
+        state.warps.retain(|w| w.entity.entity_id != entity_id);
+        state.effects.cancel(entity_id);
 
         let killer_id = killer_uuid.map(player_id).or(fallback);
         if let Some(killer_id) = killer_id
@@ -755,6 +767,7 @@ impl Game {
         self.advance_flights().await;
         self.advance_armed().await;
         self.advance_healings().await;
+        self.advance_warps().await;
         self.advance_effects().await;
         self.advance_arrows().await;
         self.advance_celebration().await;
@@ -773,6 +786,9 @@ impl Game {
         }
         for totem in state.healings.drain(..) {
             totem.entity.remove();
+        }
+        for warp in state.warps.drain(..) {
+            warp.entity.remove();
         }
         state.effects = Effects::new();
         state.arrows.clear();
@@ -962,6 +978,9 @@ impl Game {
         for totem in state.healings.drain(..) {
             totem.entity.remove();
         }
+        for warp in state.warps.drain(..) {
+            warp.entity.remove();
+        }
         state.effects = Effects::new();
         state.arrows.clear();
         state.celebration = None;
@@ -1036,6 +1055,7 @@ impl Game {
         let mut children = Vec::new();
         let mut new_armed = Vec::new();
         let mut new_healings = Vec::new();
+        let mut new_warps = Vec::new();
         let mut trail = Vec::new();
         let mut removed_ids = Vec::new();
 
@@ -1173,6 +1193,29 @@ impl Game {
                         pulse_in: HEALING_PULSE_TICKS,
                         pulses: 0,
                     });
+                } else if anchors_on_landing(airborne.flight.kind) {
+                    let actions = plan(airborne.flight.kind, pos, airborne.flight.team);
+                    if let Err(error) =
+                        apply(&self.arena.world, None, &players_with_teams, &actions).await
+                    {
+                        tracing::warn!("échec d'ancrage du mouton à distorsion : {error}");
+                    }
+                    airborne.entity.ai.set(false);
+                    airborne.entity.flags.set_gravity(true);
+                    airborne.entity.flags.set_invulnerable(false);
+                    airborne.entity.set_velocity(vector(Vec3::ZERO));
+                    airborne.entity.name.set(display_name(airborne.flight.kind));
+                    airborne.entity.name.set_visible(true);
+                    self.lock().effects.start_anchored(
+                        airborne.flight.kind,
+                        pos,
+                        airborne.flight.team,
+                        Some(entity_id),
+                    );
+                    new_warps.push(ActiveWarp {
+                        entity: airborne.entity,
+                        remaining_ticks: WARP_DURATION_TICKS,
+                    });
                 } else if arms_on_impact(airborne.flight.kind) {
                     if disables_ai_when_armed(airborne.flight.kind) {
                         airborne.entity.ai.set(false);
@@ -1236,6 +1279,7 @@ impl Game {
         }
         new_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
         new_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
+        new_warps.retain(|warp| state.sheep_kinds.contains_key(&warp.entity.entity_id));
         next.retain(|airborne| state.sheep_kinds.contains_key(&airborne.entity.entity_id));
         for child in &children {
             state
@@ -1244,6 +1288,7 @@ impl Game {
         }
         state.armed.extend(new_armed);
         state.healings.extend(new_healings);
+        state.warps.extend(new_warps);
         next.extend(children);
         next.truncate(MAX_CONCURRENT_FLIGHTS.saturating_sub(state.flights.len()));
         state.flights.extend(next);
@@ -1456,6 +1501,47 @@ impl Game {
         }
         next_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
         state.healings.extend(next_healings);
+    }
+
+    async fn advance_warps(&self) {
+        let (warps, void_fall_y) = {
+            let mut state = self.lock();
+            if state.warps.is_empty() {
+                return;
+            }
+            let void_fall_y = state.session.layout().settings().void_fall_y;
+            (std::mem::take(&mut state.warps), void_fall_y)
+        };
+
+        let mut kept = Vec::with_capacity(warps.len());
+        let mut finished = Vec::new();
+        for mut warp in warps {
+            let entity_id = warp.entity.entity_id;
+            warp.remaining_ticks = warp.remaining_ticks.saturating_sub(1);
+            let alive_at = match warp.entity.get_state().await {
+                Ok(sheep) if sheep.health.is_none_or(|health| health > 0.0) => {
+                    Some(vec3(sheep.entity.position))
+                }
+                _ => None,
+            };
+            match alive_at {
+                Some(pos) if warp.remaining_ticks > 0 && pos.y >= void_fall_y => kept.push(warp),
+                Some(_) => {
+                    warp.entity.remove();
+                    finished.push(entity_id);
+                }
+                None => finished.push(entity_id),
+            }
+        }
+
+        let mut state = self.lock();
+        for id in finished {
+            state.sheep_kinds.remove(&id);
+            state.last_sheep_damager.remove(&id);
+            state.effects.cancel(id);
+        }
+        kept.retain(|warp| state.sheep_kinds.contains_key(&warp.entity.entity_id));
+        state.warps.extend(kept);
     }
 
     async fn advance_fall_guards(&self) {
