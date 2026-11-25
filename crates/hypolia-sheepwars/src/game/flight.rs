@@ -32,16 +32,17 @@ pub const fn waits_for_ground(kind: SheepKind) -> bool {
 pub const fn arms_on_impact(kind: SheepKind) -> bool {
     !(matches!(
         kind,
-        SheepKind::Healing | SheepKind::Boarding | SheepKind::Torpedo
+        SheepKind::Healing | SheepKind::Boarding | SheepKind::Torpedo | SheepKind::Warp
     ) || lands_instantly(kind)
         || is_fragment(kind))
 }
 
 pub const fn lands_instantly(kind: SheepKind) -> bool {
-    matches!(
-        kind,
-        SheepKind::Quake | SheepKind::Warp | SheepKind::Intergalactic
-    )
+    matches!(kind, SheepKind::Quake | SheepKind::Intergalactic)
+}
+
+pub const fn anchors_on_landing(kind: SheepKind) -> bool {
+    matches!(kind, SheepKind::Warp)
 }
 
 pub const fn disables_ai_when_armed(kind: SheepKind) -> bool {

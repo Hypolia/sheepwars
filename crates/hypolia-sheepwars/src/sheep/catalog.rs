@@ -88,9 +88,11 @@ pub const WARP_PUSH: f64 = 2.0;
 pub const WARP_LIFT: f64 = 0.85;
 pub const WARP_BLINDNESS_TICKS: i32 = 40;
 pub const WARP_BLINDNESS_AMPLIFIER: u8 = 0;
-pub const WARP_DELAY_TICKS: u32 = 40;
-pub const WARP_BLOCK_PAIRS: u32 = 12;
-pub const WARP_BLOCK_RADIUS: f64 = 4.0;
+pub const WARP_DURATION_TICKS: u32 = 100;
+pub const WARP_WAVE_TICKS: u32 = 10;
+pub const WARP_BLOCK_PAIRS: u32 = 24;
+pub const WARP_BLOCK_RADIUS: f64 = 5.0;
+pub const WARP_VANISH_PERCENT: u64 = 30;
 
 pub const INTERGALACTIC_METEORS: u32 = 8;
 pub const INTERGALACTIC_SPREAD: f64 = 8.0;

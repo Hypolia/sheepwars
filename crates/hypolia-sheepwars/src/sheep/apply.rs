@@ -153,8 +153,13 @@ pub async fn apply(
             } => {
                 clear_cells(world, column_cells(center, radius, height)).await;
             }
-            Action::SwapBlocks { a, b } => {
-                swap_blocks(world, a, b).await;
+            Action::SwapBlocks {
+                a,
+                b,
+                lose_a,
+                lose_b,
+            } => {
+                swap_blocks(world, a, b, [lose_a, lose_b]).await;
             }
             Action::SwapPositions {
                 team,
@@ -300,8 +305,11 @@ async fn set_block_if_valid(world: &World, at: Cell, block: BlockKind) {
 }
 
 const CLEAR_BATCH: usize = 512;
-const SWAP_VISUAL_DELAY: Duration = Duration::from_millis(500);
-const SWAP_VISUAL_SPEED: f64 = 0.08;
+const SWAP_APPEAR_DELAY: Duration = Duration::from_millis(250);
+const SWAP_PLACE_DELAY: Duration = Duration::from_millis(200);
+const SWAP_CLOUD_COUNT: i32 = 30;
+const SWAP_CLOUD_SPREAD: f64 = 0.35;
+const SWAP_CLOUD_SPEED: f64 = 0.1;
 
 fn sphere_cells(center: Vec3, radius: f64) -> Vec<Cell> {
     let reach = radius.ceil() as i32;
@@ -370,15 +378,25 @@ async fn clear_cells(world: &World, cells: Vec<Cell>) {
     }
 }
 
-fn block_center(cell: Cell) -> Position {
-    Position {
+fn warp_cloud(world: &World, cell: Cell) {
+    let center = Position {
         x: f64::from(cell.x) + 0.5,
-        y: f64::from(cell.y),
+        y: f64::from(cell.y) + 0.5,
         z: f64::from(cell.z) + 0.5,
-    }
+    };
+    world.particle.spawn(
+        ParticleBurst::new(Particle::Portal, center)
+            .count(SWAP_CLOUD_COUNT)
+            .spread(Vector {
+                x: SWAP_CLOUD_SPREAD,
+                y: SWAP_CLOUD_SPREAD,
+                z: SWAP_CLOUD_SPREAD,
+            })
+            .speed(SWAP_CLOUD_SPEED),
+    );
 }
 
-async fn swap_blocks(world: &World, a: Cell, b: Cell) {
+async fn swap_blocks(world: &World, a: Cell, b: Cell, lost: [bool; 2]) {
     if a == b {
         return;
     }
@@ -401,35 +419,33 @@ async fn swap_blocks(world: &World, a: Cell, b: Cell) {
     }
     world.block(block_pos(a)).set(BlockType::Air);
     world.block(block_pos(b)).set(BlockType::Air);
-    let mut visuals = Vec::new();
-    for (state, from, to) in [(&first, a, b), (&second, b, a)] {
-        if is_air(state.kind) {
-            continue;
-        }
-        let velocity = Vector {
-            x: f64::from(to.x - from.x) * SWAP_VISUAL_SPEED,
-            y: f64::from(to.y - from.y) * SWAP_VISUAL_SPEED,
-            z: f64::from(to.z - from.z) * SWAP_VISUAL_SPEED,
-        };
-        match world
-            .spawn_falling_block(state.kind, block_center(from), velocity)
-            .await
-        {
-            Ok(entity) => {
-                entity.flags.set_gravity(false);
-                visuals.push(entity);
-            }
-            Err(error) => tracing::warn!("échec bloc visuel distorsion : {error}"),
+    let air = BlockState {
+        kind: BlockType::Air,
+        properties: Vec::new(),
+    };
+    let (at_a, at_b) = (
+        if lost[1] { air.clone() } else { second.clone() },
+        if lost[0] { air } else { first.clone() },
+    );
+    let arrivals: Vec<Cell> = [(a, &at_a), (b, &at_b)]
+        .into_iter()
+        .filter(|(_, state)| !is_air(state.kind))
+        .map(|(cell, _)| cell)
+        .collect();
+    for (cell, state) in [(a, &first), (b, &second)] {
+        if !is_air(state.kind) {
+            warp_cloud(world, cell);
         }
     }
     let world = world.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(SWAP_VISUAL_DELAY).await;
-        for entity in &visuals {
-            entity.remove();
+        tokio::time::sleep(SWAP_APPEAR_DELAY).await;
+        for cell in arrivals {
+            warp_cloud(&world, cell);
         }
-        place_state(&world, a, &second);
-        place_state(&world, b, &first);
+        tokio::time::sleep(SWAP_PLACE_DELAY).await;
+        place_state(&world, a, &at_a);
+        place_state(&world, b, &at_b);
     });
 }
 

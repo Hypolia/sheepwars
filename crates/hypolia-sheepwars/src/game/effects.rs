@@ -26,7 +26,9 @@ use crate::sheep::SoundKind;
 use crate::sheep::Vec3;
 use crate::sheep::WARP_BLOCK_PAIRS;
 use crate::sheep::WARP_BLOCK_RADIUS;
-use crate::sheep::WARP_DELAY_TICKS;
+use crate::sheep::WARP_DURATION_TICKS;
+use crate::sheep::WARP_VANISH_PERCENT;
+use crate::sheep::WARP_WAVE_TICKS;
 
 const METEOR_OFFSET_X: f64 = 6.0;
 const METEOR_OFFSET_Z: f64 = 4.0;
@@ -57,6 +59,10 @@ impl Rng {
         z ^ (z >> 31)
     }
 
+    fn vanishes(&mut self) -> bool {
+        self.next() % 100 < WARP_VANISH_PERCENT
+    }
+
     fn offset(&mut self, bound: i32) -> i32 {
         let span = (bound * 2 + 1) as u64;
         (self.next() % span) as i32 - bound
@@ -65,10 +71,27 @@ impl Rng {
 
 #[derive(Debug)]
 enum Effect {
-    Quake { at: Vec3, team: TeamId, age: u32 },
-    Warp { at: Vec3, age: u32, rng: Rng },
-    Meteor { at: Vec3, team: TeamId, age: u32 },
-    Frost { at: Vec3, team: TeamId, age: u32 },
+    Quake {
+        at: Vec3,
+        team: TeamId,
+        age: u32,
+    },
+    Warp {
+        at: Vec3,
+        age: u32,
+        rng: Rng,
+        anchor: Option<i32>,
+    },
+    Meteor {
+        at: Vec3,
+        team: TeamId,
+        age: u32,
+    },
+    Frost {
+        at: Vec3,
+        team: TeamId,
+        age: u32,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -82,12 +105,17 @@ impl Effects {
     }
 
     pub fn start(&mut self, kind: SheepKind, at: Vec3, team: TeamId) {
+        self.start_anchored(kind, at, team, None);
+    }
+
+    pub fn start_anchored(&mut self, kind: SheepKind, at: Vec3, team: TeamId, anchor: Option<i32>) {
         let effect = match kind {
             SheepKind::Quake => Effect::Quake { at, team, age: 0 },
             SheepKind::Warp => Effect::Warp {
                 at,
                 age: 0,
                 rng: Rng::seeded(at),
+                anchor,
             },
             SheepKind::Intergalactic => Effect::Meteor { at, team, age: 0 },
             SheepKind::Frozen => Effect::Frost { at, team, age: 0 },
@@ -106,13 +134,12 @@ impl Effects {
                 }
                 *age < QUAKE_DURATION_TICKS
             }
-            Effect::Warp { at, age, rng } => {
+            Effect::Warp { at, age, rng, .. } => {
                 *age += 1;
-                if *age < WARP_DELAY_TICKS {
-                    return true;
+                if age.is_multiple_of(WARP_WAVE_TICKS) {
+                    warp_wave(*at, rng, &mut actions);
                 }
-                warp_burst(*at, rng, &mut actions);
-                false
+                *age < WARP_DURATION_TICKS
             }
             Effect::Meteor { at, team, age } => {
                 *age += 1;
@@ -126,6 +153,12 @@ impl Effects {
             }
         });
         actions
+    }
+
+    pub fn cancel(&mut self, anchor_id: i32) {
+        self.active.retain(
+            |effect| !matches!(effect, Effect::Warp { anchor: Some(id), .. } if *id == anchor_id),
+        );
     }
 
     pub fn is_idle(&self) -> bool {
@@ -275,7 +308,7 @@ fn bound_attempts() -> std::ops::Range<u32> {
     0..WARP_MAX_ATTEMPTS
 }
 
-fn warp_burst(at: Vec3, rng: &mut Rng, actions: &mut Vec<Action>) {
+fn warp_wave(at: Vec3, rng: &mut Rng, actions: &mut Vec<Action>) {
     let mut used: Vec<Cell> = Vec::new();
     for _ in 0..WARP_BLOCK_PAIRS {
         let Some(a) = draw_cell(at, rng, &used) else {
@@ -286,17 +319,13 @@ fn warp_burst(at: Vec3, rng: &mut Rng, actions: &mut Vec<Action>) {
             break;
         };
         used.push(b);
-        actions.push(Action::SwapBlocks { a, b });
+        actions.push(Action::SwapBlocks {
+            a,
+            b,
+            lose_a: rng.vanishes(),
+            lose_b: rng.vanishes(),
+        });
     }
-    actions.push(Action::Particle {
-        kind: ParticleKind::Portal,
-        at,
-        count: 80,
-    });
-    actions.push(Action::Sound {
-        kind: SoundKind::Warp,
-        at,
-    });
 }
 
 fn meteor_step(at: Vec3, enemies: TeamId, age: u32, actions: &mut Vec<Action>) {
@@ -424,31 +453,43 @@ mod tests {
         assert!(effects.is_idle());
     }
 
-    #[test]
-    fn spec_swi_13_warp_waits_then_swaps_twelve_pairs() {
-        let mut effects = Effects::new();
-        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
-        let frames = run(&mut effects, WARP_DELAY_TICKS - 1);
-        assert!(frames.iter().flatten().all(|a| !is_game_action(a)));
-        assert!(!effects.is_idle());
-        let burst = effects.tick();
-        let swaps: Vec<(Cell, Cell)> = burst
+    fn swaps_of(frame: &[Action]) -> Vec<(Cell, Cell)> {
+        frame
             .iter()
             .filter_map(|a| match a {
-                Action::SwapBlocks { a, b } => Some((*a, *b)),
+                Action::SwapBlocks { a, b, .. } => Some((*a, *b)),
                 _ => None,
             })
-            .collect();
-        assert_eq!(swaps.len(), WARP_BLOCK_PAIRS as usize);
+            .collect()
+    }
+
+    #[test]
+    fn warp_sends_a_wave_every_interval_for_its_whole_duration() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, WARP_DURATION_TICKS);
+        for (index, frame) in frames.iter().enumerate() {
+            let age = index as u32 + 1;
+            let expected = if age.is_multiple_of(WARP_WAVE_TICKS) {
+                WARP_BLOCK_PAIRS as usize
+            } else {
+                0
+            };
+            assert_eq!(swaps_of(frame).len(), expected, "tick {age}");
+        }
+        assert!(effects.is_idle());
+    }
+
+    #[test]
+    fn warp_waves_stay_in_the_radius_without_reusing_a_cell() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, WARP_WAVE_TICKS);
+        let origin = ORIGIN.cell();
         let mut seen: Vec<Cell> = Vec::new();
-        for (a, b) in swaps {
+        for (a, b) in swaps_of(&frames[frames.len() - 1]) {
             assert_ne!(a, b);
             for cell in [a, b] {
-                let dx = f64::from(cell.x) - ORIGIN.x;
-                let dy = f64::from(cell.y) - ORIGIN.y;
-                let dz = f64::from(cell.z) - ORIGIN.z;
-                assert!((dx * dx + dy * dy + dz * dz).sqrt() <= WARP_BLOCK_RADIUS + 1.0);
-                let origin = ORIGIN.cell();
                 let ix = f64::from(cell.x - origin.x);
                 let iy = f64::from(cell.y - origin.y);
                 let iz = f64::from(cell.z - origin.z);
@@ -457,21 +498,70 @@ mod tests {
                 seen.push(cell);
             }
         }
-        assert!(burst.iter().any(|a| matches!(
-            a,
-            Action::Particle {
-                kind: ParticleKind::Portal,
-                ..
-            }
-        )));
-        assert!(burst.iter().any(|a| matches!(
-            a,
-            Action::Sound {
-                kind: SoundKind::Warp,
-                ..
-            }
-        )));
+    }
+
+    #[test]
+    fn warp_waves_only_swap_blocks_and_make_no_sound() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, WARP_DURATION_TICKS);
+        assert!(
+            frames
+                .iter()
+                .flatten()
+                .all(|a| matches!(a, Action::SwapBlocks { .. }))
+        );
+    }
+
+    #[test]
+    fn about_thirty_percent_of_teleported_blocks_vanish() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
+        let flags: Vec<bool> = run(&mut effects, WARP_DURATION_TICKS)
+            .iter()
+            .flatten()
+            .flat_map(|a| match a {
+                Action::SwapBlocks { lose_a, lose_b, .. } => [*lose_a, *lose_b],
+                _ => unreachable!(),
+            })
+            .collect();
+        let share = flags.iter().filter(|lost| **lost).count() as f64 / flags.len() as f64;
+        assert!((0.2..0.4).contains(&share), "share {share}");
+    }
+
+    #[test]
+    fn warp_picks_different_cells_each_wave() {
+        let mut effects = Effects::new();
+        effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
+        let frames = run(&mut effects, WARP_WAVE_TICKS * 2);
+        assert_ne!(
+            swaps_of(&frames[(WARP_WAVE_TICKS - 1) as usize]),
+            swaps_of(&frames[(WARP_WAVE_TICKS * 2 - 1) as usize])
+        );
+    }
+
+    #[test]
+    fn killing_the_anchor_sheep_stops_the_warp() {
+        let mut effects = Effects::new();
+        effects.start_anchored(SheepKind::Warp, ORIGIN, TeamId::Red, Some(7));
+        run(&mut effects, WARP_WAVE_TICKS + 1);
+        effects.cancel(7);
         assert!(effects.is_idle());
+        assert!(
+            run(&mut effects, WARP_DURATION_TICKS)
+                .iter()
+                .flatten()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancelling_another_sheep_leaves_the_warp_running() {
+        let mut effects = Effects::new();
+        effects.start_anchored(SheepKind::Warp, ORIGIN, TeamId::Red, Some(7));
+        effects.cancel(8);
+        assert!(!effects.is_idle());
     }
 
     #[test]
@@ -726,7 +816,7 @@ mod tests {
         effects.start(SheepKind::Warp, ORIGIN, TeamId::Red);
         run(&mut effects, INTERGALACTIC_FALL_TICKS);
         assert!(!effects.is_idle());
-        run(&mut effects, WARP_DELAY_TICKS - INTERGALACTIC_FALL_TICKS);
+        run(&mut effects, WARP_DURATION_TICKS - INTERGALACTIC_FALL_TICKS);
         assert!(effects.is_idle());
     }
 }
