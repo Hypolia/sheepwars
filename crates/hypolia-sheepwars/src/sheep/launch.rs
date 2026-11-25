@@ -4,6 +4,7 @@ pub const DEFAULT_THROW_POWER: f64 = 2.2;
 pub const LAUNCH_ARC_LIFT: f64 = 0.14;
 pub const STEEP_DOWN_PITCH_DEG: f64 = 35.0;
 pub const SPAWN_FORWARD_OFFSET: f64 = 0.9;
+pub const PLACEMENT_LIFT: f64 = 0.1;
 pub const PROJECTILE_DRAG: f64 = 0.99;
 pub const PROJECTILE_GRAVITY: f64 = 0.045;
 
@@ -23,6 +24,16 @@ pub fn spawn_point(eye: Vec3, yaw_degrees: f64, pitch_degrees: f64) -> Vec3 {
         x: eye.x + dir.x * SPAWN_FORWARD_OFFSET,
         y: (eye.y + dir.y * SPAWN_FORWARD_OFFSET).max(eye.y - 0.3),
         z: eye.z + dir.z * SPAWN_FORWARD_OFFSET,
+    }
+}
+
+pub fn placement_point(feet: Vec3, yaw_degrees: f64, pitch_degrees: f64, radius: f64) -> Vec3 {
+    let yaw = yaw_degrees.to_radians();
+    let reach = radius * pitch_degrees.to_radians().cos().max(0.0);
+    Vec3 {
+        x: feet.x - yaw.sin() * reach,
+        y: feet.y + PLACEMENT_LIFT,
+        z: feet.z + yaw.cos() * reach,
     }
 }
 
@@ -117,6 +128,32 @@ mod tests {
         assert!(close(level.y, LAUNCH_ARC_LIFT));
         let down = throw_velocity(0.0, 60.0, DEFAULT_THROW_POWER);
         assert!(down.y < -DEFAULT_THROW_POWER * 0.8);
+    }
+
+    #[test]
+    fn placement_goes_to_the_full_radius_when_looking_ahead() {
+        let feet = Vec3 {
+            x: 10.0,
+            y: 64.0,
+            z: -4.0,
+        };
+        let point = placement_point(feet, 90.0, 0.0, 2.0);
+        assert!((point.x - 8.0).abs() < 1e-9);
+        assert!((point.z + 4.0).abs() < 1e-9);
+        assert!(point.y > feet.y);
+    }
+
+    #[test]
+    fn placement_never_leaves_the_radius_and_shrinks_when_looking_down() {
+        let feet = Vec3::ZERO;
+        for pitch in [-90.0, -45.0, 0.0, 30.0, 90.0] {
+            for yaw in [0.0, 45.0, 135.0, 270.0] {
+                let point = placement_point(feet, yaw, pitch, 2.0);
+                assert!(point.x.hypot(point.z) <= 2.0 + 1e-9);
+            }
+        }
+        let down = placement_point(feet, 0.0, 90.0, 2.0);
+        assert!(down.x.hypot(down.z) < 1e-9);
     }
 
     #[test]

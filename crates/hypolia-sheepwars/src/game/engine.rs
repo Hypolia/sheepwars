@@ -24,11 +24,10 @@ use super::display::lives_line;
 use super::effects::Effects;
 use super::fall_guard::FallGuards;
 use super::flight::{
-    EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, MAX_FLIGHT_TICKS,
-    RIDER_MAX_SPEED, anchors_on_landing, arms_on_impact, can_launch, chase_detonates,
-    chase_velocity, disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks,
-    initial_velocity, rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears,
-    torpedo_triggered,
+    EYE_HEIGHT, Flight, LANDING_GRACE_TICKS, MAX_CONCURRENT_FLIGHTS, RIDER_MAX_SPEED,
+    anchors_on_landing, arms_on_impact, can_launch, chase_detonates, chase_velocity,
+    disables_ai_when_armed, flight_velocity, fuse_label, fuse_ticks, initial_velocity,
+    rider_needs_teleport, starts_effect, torpedo_clear, torpedo_clears, torpedo_triggered,
 };
 use super::intent::Intent;
 use super::report::{
@@ -42,10 +41,10 @@ use crate::domain::{PlayerId, SheepKind, TeamId};
 use crate::hud::{Hud, bossbar_progress, bossbar_title};
 use crate::orchestrator::{SheepWarsOrchestratorClient, spectates_here};
 use crate::sheep::{
-    Action, HEALING_DURATION_TICKS, HEALING_PULSE_TICKS, ParticleKind, SEEKER_RANGE,
-    TORPEDO_TRIGGER_RADIUS, Vec3, WARP_DURATION_TICKS, apply, chases_after_impact, clamp_speed,
-    display_name, flies_straight, healing_pulse, nearest_enemy, plan, sheep_dye_color, sheep_wool,
-    spawn_point,
+    Action, HEALING_DURATION_TICKS, HEALING_PLACE_RADIUS, HEALING_PULSE_TICKS, ParticleKind,
+    SEEKER_RANGE, TORPEDO_TRIGGER_RADIUS, Vec3, WARP_DURATION_TICKS, apply, chases_after_impact,
+    clamp_speed, display_name, flies_straight, healing_pulse, nearest_enemy, placement_point, plan,
+    sheep_dye_color, sheep_wool, spawn_point,
 };
 
 pub const HUD_REFRESH_TICKS: u64 = 5;
@@ -671,6 +670,57 @@ impl Game {
         self.teleport(player, lobby).await;
     }
 
+    async fn place_healing(&self, player: &Player, team: TeamId) -> bool {
+        let at = placement_point(
+            vec3(player.position),
+            f64::from(player.rotation.yaw),
+            f64::from(player.rotation.pitch),
+            HEALING_PLACE_RADIUS,
+        );
+        let sheep = match self
+            .arena
+            .world
+            .spawn(EntityType::Sheep, position(at))
+            .await
+        {
+            Ok(sheep) => sheep,
+            Err(error) => {
+                tracing::warn!(
+                    "impossible de poser un mouton soigneur pour {} : {error}",
+                    player.name
+                );
+                return false;
+            }
+        };
+        if let Some(typed) = sheep.as_sheep() {
+            typed.set_color(sheep_dye_color(SheepKind::Healing));
+        }
+        sheep.ai.set(false);
+        sheep.flags.set_gravity(true);
+        sheep.flags.set_invulnerable(false);
+        sheep.name.set(display_name(SheepKind::Healing));
+        sheep.name.set_visible(true);
+        player
+            .inventory
+            .remove(ItemRemoval::new(sheep_wool(SheepKind::Healing), 1));
+        self.arena
+            .world
+            .sound
+            .play(SoundCue::new(Sound::EntityPlayerLevelup).at(position(at)));
+        let mut state = self.lock();
+        state
+            .sheep_kinds
+            .insert(sheep.entity_id, SheepKind::Healing);
+        state.healings.push(ActiveHealing {
+            entity: sheep,
+            team,
+            remaining_ticks: HEALING_DURATION_TICKS,
+            pulse_in: 0,
+            pulses: 0,
+        });
+        true
+    }
+
     pub async fn throw(&self, player: &Player, kind: SheepKind) -> bool {
         let id = player_id(player.uuid);
         let (team, trail) = {
@@ -688,6 +738,9 @@ impl Game {
                 .and_then(|loadout| loadout.sheep_trail);
             (team, trail)
         };
+        if kind == SheepKind::Healing {
+            return self.place_healing(player, team).await;
+        }
         let eye = Vec3 {
             x: player.position.x,
             y: player.position.y + EYE_HEIGHT,
@@ -1054,7 +1107,6 @@ impl Game {
         let mut next = Vec::with_capacity(flights.len());
         let mut children = Vec::new();
         let mut new_armed = Vec::new();
-        let mut new_healings = Vec::new();
         let mut new_warps = Vec::new();
         let mut trail = Vec::new();
         let mut removed_ids = Vec::new();
@@ -1170,30 +1222,7 @@ impl Game {
             let wall_hit = expected_horiz > 0.35 && moved_horiz < expected_horiz * 0.2;
 
             if airborne.flight.should_land(sheep.on_ground, wall_hit) || torpedo_hit {
-                if airborne.flight.kind == SheepKind::Healing
-                    && sheep.on_ground
-                    && airborne.flight.age < MAX_FLIGHT_TICKS
-                {
-                    let actions = plan(SheepKind::Healing, pos, airborne.flight.team);
-                    if let Err(error) =
-                        apply(&self.arena.world, None, &players_with_teams, &actions).await
-                    {
-                        tracing::warn!("échec d'ancrage du mouton soigneur : {error}");
-                    }
-                    airborne.entity.ai.set(false);
-                    airborne.entity.flags.set_gravity(true);
-                    airborne.entity.flags.set_invulnerable(false);
-                    airborne.entity.set_velocity(vector(Vec3::ZERO));
-                    airborne.entity.name.set(display_name(SheepKind::Healing));
-                    airborne.entity.name.set_visible(true);
-                    new_healings.push(ActiveHealing {
-                        entity: airborne.entity,
-                        team: airborne.flight.team,
-                        remaining_ticks: HEALING_DURATION_TICKS,
-                        pulse_in: HEALING_PULSE_TICKS,
-                        pulses: 0,
-                    });
-                } else if anchors_on_landing(airborne.flight.kind) {
+                if anchors_on_landing(airborne.flight.kind) {
                     let actions = plan(airborne.flight.kind, pos, airborne.flight.team);
                     if let Err(error) =
                         apply(&self.arena.world, None, &players_with_teams, &actions).await
@@ -1278,7 +1307,6 @@ impl Game {
             state.last_sheep_damager.remove(&id);
         }
         new_armed.retain(|armed| state.sheep_kinds.contains_key(&armed.entity.entity_id));
-        new_healings.retain(|totem| state.sheep_kinds.contains_key(&totem.entity.entity_id));
         new_warps.retain(|warp| state.sheep_kinds.contains_key(&warp.entity.entity_id));
         next.retain(|airborne| state.sheep_kinds.contains_key(&airborne.entity.entity_id));
         for child in &children {
@@ -1287,7 +1315,6 @@ impl Game {
                 .insert(child.entity.entity_id, child.flight.kind);
         }
         state.armed.extend(new_armed);
-        state.healings.extend(new_healings);
         state.warps.extend(new_warps);
         next.extend(children);
         next.truncate(MAX_CONCURRENT_FLIGHTS.saturating_sub(state.flights.len()));

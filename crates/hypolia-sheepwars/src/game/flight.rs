@@ -25,10 +25,6 @@ pub struct Flight {
     pub age: u32,
 }
 
-pub const fn waits_for_ground(kind: SheepKind) -> bool {
-    matches!(kind, SheepKind::Healing)
-}
-
 pub const fn arms_on_impact(kind: SheepKind) -> bool {
     !(matches!(
         kind,
@@ -152,7 +148,7 @@ impl Flight {
         if flies_straight(self.kind) {
             return self.age >= TORPEDO_MAX_FLIGHT_TICKS;
         }
-        let hit = on_ground || (wall_hit && !waits_for_ground(self.kind));
+        let hit = on_ground || wall_hit;
         (hit && self.age >= landing_grace_ticks(self.kind)) || self.age >= MAX_FLIGHT_TICKS
     }
 }
@@ -201,11 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn wall_impact_detonates_offensive_sheep_but_healing_waits_for_ground() {
+    fn wall_impact_lands_a_sheep() {
         assert!(flight(SheepKind::Incendiary, LANDING_GRACE_TICKS).should_land(false, true));
         assert!(flight(SheepKind::Boarding, LANDING_GRACE_TICKS).should_land(false, true));
-        assert!(!flight(SheepKind::Healing, LANDING_GRACE_TICKS).should_land(false, true));
-        assert!(flight(SheepKind::Healing, LANDING_GRACE_TICKS).should_land(true, true));
     }
 
     #[test]
